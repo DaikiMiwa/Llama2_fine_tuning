@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "llama2-fine-tuning"
+version = "0.1.0"
+description = ""
+authors = ["DaikiMiwa <miwa.daiki.mllab.nit@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+transformers = "^4.32.0"
+sentencepiece = "^0.1.99"
+protobuf = "^4.24.1"
+bitsandbytes = "^0.41.1"
+accelerate = "^0.22.0"
+appdirs = "^1.4.4"
+datasets = "^2.14.4"
+peft = "^0.5.0"
+stl = "^0.0.3"
+black = {extras = ["jupyter"], version = "^23.7.0"}
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.7.0"
+isort = "^5.12.0"
+jupyter = "^1.0.0"
+jupytext = "^1.15.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
