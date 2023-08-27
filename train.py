@@ -4,159 +4,13 @@ import peft
 import torch
 import transformers
 from datasets import load_dataset
-# todo : CasualLM と CasualLLM の違いを調べる
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           BitsAndBytesConfig, TrainingArguments)
+import wandb
+import fire
 from trl import SFTTrainer
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-# # 設定
-use_gradient_checkpointing = True
-
-output_dir = "./llama2-7b-lora"
-
-# # 量子化読み込みの設定
-
-# 8bit量子化を行う
-load_in_8bit = True
-load_in_4bit = False
-
-quantization_config = BitsAndBytesConfig(
-    load_in_8bit=load_in_8bit, load_in_4bit=load_in_4bit
-)
-
-# GPUの0番目を使う
-device_map = {"":0}
-# bfloat16を使う
-torch_dtype = torch.float16
-
-# # モデルの読み込み
-
-# +
-# hugging faceのモデルを指定
-# use llama2
-base_model = "meta-llama/Llama-2-7b-hf"
-
-model = AutoModelForCausalLM.from_pretrained(
-    base_model,
-    quantization_config=quantization_config,
-    device_map=device_map,
-    torch_dtype=torch_dtype,
-    trust_remote_code=True,
-)
-# -
-tokenizer = AutoTokenizer.from_pretrained(base_model, add_eos_token=True)
-tokenizer.pad_token_id = 0
-
-# peftの設定
-lora_r: int = 8
-lora_alpha: int = 16
-lora_dropout: float = 0.05
-lora_target_modules: list[str] = None
-
-lora_config = peft.LoraConfig(
-    r=lora_r,
-    lora_alpha=lora_alpha,
-    bias="none",
-    task_type="CASUAL_LM",
-)
-
-peft_config = lora_config
-# この関数でモオリジナルのモデルをフリーズさせる
-model = peft.prepare_model_for_kbit_training(model,use_gradient_checkpointing=use_gradient_checkpointing)
-model = peft.get_peft_model(model,peft_config)
-
-# checkpointのフォルダからの読み込み
-# checkpoint_dir = None
-# if os.path.exists(output_dir):
-#     files = os.listdir(output_dir)
-#     checkpoint_files = list(filter(
-#             lambda x:os.path.isfile(os.path.join(output_dir,x)),
-#             os.listdir(output_dir),
-#             ))
-#     checkpoint_dirs = list(filter(
-#             lambda x:os.path.isdir(os.path.join(output_dir,x)),
-#             os.listdir(output_dir),
-#            ))
-#     if "adapter_config.json" in checkpoint_files:
-#         peft_weight = peft.load_peft_weights(output_dir,device=device_map)
-#         model = peft.set_peft_model_state_dict(model,peft_weight)
-#         checkpoint_dir = None
-#         print("-------------------------------------")
-#         print(f"find adapter_config.json in {output_dir}")
-#         print("-------------------------------------")
-#     elif len(checkpoint_dirs) > 0 :
-#         print(checkpoint_dirs)
-#         for checkpoint_dir in sorted(checkpoint_dirs,reverse=True):
-#             print(os.listdir(os.path.join(output_dir,checkpoint_dir)))
-#             if "adapter_config.json" in os.listdir(os.path.join(output_dir,checkpoint_dir)):
-#                 peft_weight = torch.load(os.path.join(output_dir,checkpoint_dir,"adapter_model.bin"))
-#                 model = peft.set_peft_model_state_dict(model,peft_weight)
-#                 checkpoint_dir = os.path.join(output_dir,checkpoint_dir)
-#                 print("-------------------------------------")
-#                 print(f"find adapter_config.json in {checkpoint_dir}")
-#                 print("-------------------------------------")
-#                 lora_config=None
-#                 break
-#     else :
-#         print("-------------------------------------")
-#         print("can't find adapter_config.json")
-#         print("-------------------------------------")
-# else :
-#     print("-------------------------------------")
-#     print("can't find adapter_config.json")
-#     print("-------------------------------------")
-
-model.print_trainable_parameters()
-
-# # 学習
-# ## 基本の学習パラメータの設定
-batch_size = 16
-micro_batch_size = 4
-gradient_accumulation_steps = batch_size // micro_batch_size
-learining_rate = 3e-4
-num_train_epochs = 1
-logging_steps = 10
-# データセットとepoch数から最大ステップ数を計算する
-max_steps = -1
-eval_steps = 200
-save_steps = 200
-save_total_limit = 3
-val_set_size = 120
-group_by_length = False
-max_seq_length = 256
-
-
 def formatting_func(example: dict):
-    """データセットのフォーマットを設定する関数
-
-    Args :
-        example (dict): データセットのdict
-    Returns
-        (str): フォーマットされたデータセット
-    """
-    if example["input"] != "":
-        return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. 
-
-            ### Instruction:
-            {example["instruction"]}
-            
-            ### Input:
-            {example["input"]}
-            
-            ### Response:
-            {example["output"]}"""
-    else:
-        return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request. 
-
-            ### Instruction:
-            {example["instruction"]}
-            
-            ### Response:
-            {example["output"]}"""
-
-def _formatting_func(example: dict):
     # packing=Falseの時に必要
     """データセットのフォーマットを設定する関数
 
@@ -189,50 +43,143 @@ def _formatting_func(example: dict):
         
     return output_texts
 
-# def formatting_func(example):
-#     text = f"###Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. \n ### Instruction: {example['instruction']}\n ### Input: {example['input']}\n ### Response: {example['output']}"
-#     return text
+def generate_peft_config(adapter: str):
+    if "lora" == adapter:
+        # とりまデフォルトで・・・
+        lora_config = peft.LoraConfig(
+            task_type="CASUAL_LM",
+        )
+        return lora_config
+    elif "adalora" == adapter:
+        # とりまデフォルトで・・・
+        return peft.AdaLoraConfig(
+            task_type="CASUAL_LM",
+        )
+    else:
+        raise ValueError(f"adapter {adapter} is not supported.")
 
-# print("------------------------------------")
-# print()
-# if checkpoint_dir is None:
-#     resume_from_checkpoint = None
-#     print(f"not resume_from_checkpoint")
-# else:
-#     print(f"resume_from_checkpoint : {checkpoint_dir}")
-# print("------------------------------------")
-# print()
+def train(
+        load_in_8bit: bool = True,
+        load_in_4bit: bool = False,
+        base_model: str = "",
+        adapter: str = "",
+        data_path : str = "math_data.json",
+        resume_from_checkpoint: bool = False,
+        ):
 
-training_args = TrainingArguments(
-    per_device_train_batch_size=micro_batch_size,
-    num_train_epochs=3,
-    learning_rate=learining_rate,
-    logging_steps=logging_steps,
-    # eval_steps, save_stepsごとに評価と保存を行う
-    eval_steps=eval_steps,
-    save_steps=save_steps,
-    save_total_limit=save_total_limit,
-    # optimizerは自然に任せる
-    optim="adamw_torch",
-    max_steps=max_steps,
-    output_dir=output_dir,
-    remove_unused_columns=False,
-    # resume_from_checkpoint=checkpoint_dir,
-)
+    # 量子化読み込みの設定
+    if not load_in_8bit ^ load_in_4bit:
+        raise ValueError("load_in_8bit and load_in_4bit cannot be True at the same time.")
 
-dataset = load_dataset("json", data_files="math_data.json")
+    # 学習に関する設定
+    ## 大事だから設定して欲しいやつ
+    if base_model == "":
+        raise ValueError("base_model is not set.")
+    if adapter not in ["lora","adalora"]:
+        raise ValueError(f"{adapter} is not supported.")
 
-# peftの重みの読み込み
+    # 大事じゃない
+    batch_size = 16
+    micro_batch_size = 4
+    use_gradient_checkpointing = True
+    num_train_epochs = 1
+    gradient_accumulation_steps = batch_size // micro_batch_size
+    device_map = {"":0} # single gpuでの学習を想定
+    torch_dtype = torch.float16 # or torch.bfloat16
+    logging_steps = 10
+    learining_rate = 3e-4
+    max_steps = -1 # データセットとepoch数から最大ステップ数を計算
+    eval_steps = 200
+    save_steps = 200
+    save_total_limit = 3
+    max_seq_length = 256
+    group_by_length = False # ?
 
-trainer = SFTTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=dataset["train"],
-    max_seq_length=max_seq_length,
-    formatting_func=_formatting_func,
-    packing=False,
-    # peft_config=peft_config,
-)
+    output_dir = f"trained_models/{base_model}_{adapter}_{num_train_epochs}"
 
-trainer.train(resume_from_checkpoint=os.path.join(output_dir,"checkpoint"))
-trainer.save_model(os.path.join(os.path.join(output_dir, f"checkpoint")))
+    # wandbの設定
+    wandb.init(
+            project="llm-fine-tuning"
+            config = {
+                "base_model": base_model,
+                "adapter": adapter,
+                "load_in_8bit": load_in_8bit,
+                "load_in_4bit": load_in_4bit,
+                "batch_size": batch_size,
+                "micro_batch_size": micro_batch_size,
+                "use_gradient_checkpointing": use_gradient_checkpointing,
+                "num_train_epochs": num_train_epochs,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "device_map": device_map,
+                "torch_dtype": torch_dtype,
+                "logging_steps": logging_steps,
+                "learining_rate": learining_rate,
+                "max_steps": max_steps,
+                "eval_steps": eval_steps,
+                "save_steps": save_steps,
+                "save_total_limit": save_total_limit,
+                "max_seq_length": max_seq_length,
+                "group_by_length": group_by_length,
+                "output_dir": output_dir,
+                "data_path": data_path,
+                "resume_from_checkpoint": resume_from_checkpoint,
+            }
+    )
+
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=load_in_8bit, load_in_4bit=load_in_4bit
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        quantization_config=quantization_config,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+            base_model, 
+            add_eos_token=True
+            ) 
+    tokenizer.pad_token_id = 0
+
+    # peftの設定
+    peft_config = generate_peft_config(adapter)
+    model = peft.prepare_model_for_kbit_training(model,use_gradient_checkpointing=use_gradient_checkpointing)
+    model = peft.get_peft_model(model,peft_config)
+    model.print_trainable_parameters()
+
+    training_args = TrainingArguments(
+        per_device_train_batch_size=micro_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        num_train_epochs=num_train_epochs,
+        learning_rate=learining_rate,
+        logging_steps=logging_steps,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
+        optim="adamw_torch",
+        max_steps=max_steps,
+        output_dir=output_dir,
+        remove_unused_columns=False, # 必要
+        report_to="wandb"
+    )
+
+    dataset = load_dataset("json", data_files=data_path)
+
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset["train"],
+        max_seq_length=max_seq_length,
+        formatting_func=_formatting_func,
+        packing=False,
+        # peft_config=peft_config,
+    )
+
+    trainer.train(resume_from_checkpoint=os.path.join(output_dir))
+    trainer.save_model(os.path.join(os.path.join(output_dir, f"result")))
+
+if __name__ == "__main__":
+    fire.Fire(train)

@@ -6,43 +6,12 @@ import time
 import peft
 import torch
 import transformers
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                          BitsAndBytesConfig, TrainingArguments)
+import wandb
 import datasets
 import numpy as np
-
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
-
-# パス
-model_path = "output_dir"
-base_model =  "meta-llama/Llama-2-7b-hf"
-checkpoint_dirs = os.listdir(model_path)
-checkpoint_path = os.path.join(model_path,sorted(checkpoint_dirs)[-1])
-
-print("loading weights from {}".format(checkpoint_path))
-
-if torch.cuda.is_available():
-    # 一つ目のgpuだけ使う
-    device = {"":0}
-else:
-    device = torch.device("cpu")
-
-# modelの読み込み
-tokenizer = AutoTokenizer.from_pretrained(
-    checkpoint_path,device_map={"":0}
-)
-tokenizer.pad_token_id = 0
-
-# ベースモデルを読み込んでからpeftの重みを読み込む
-model = AutoModelForCausalLM.from_pretrained(base_model, load_in_8bit=True, device_map={"": 0})
-model = peft.PeftModel.from_pretrained(model,checkpoint_path)
-
-# generate configの設定
-generation_config = transformers.GenerationConfig(max_new_tokens=256)
-
-# load dataset
-data_path = "./dataset/SVAMP/test.json"
-dataset = datasets.load_dataset("json", data_files=data_path)
-num_examples = len(dataset["train"])
+import fire
 
 def group_batch(batch):
     return {k: [v] for k, v in batch.items()}
@@ -51,7 +20,8 @@ def generate_prompt(example):
     output_texts = []
     for i in range(len(example["instruction"])):
         if example["input"][i] != "":
-            output_texts.append(f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+            output_texts.append(
+                f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
                     ### Instruction:
                     {example["instruction"][i]}
@@ -60,17 +30,20 @@ def generate_prompt(example):
                     {example["input"][i]}
 
                     ### Response:
-                    """)
+                    """
+            )
         else:
-            output_texts.append(f"""Below is an instruction that describes a task. Write a response that appropriately completes the request. 
+            output_texts.append(
+                f"""Below is an instruction that describes a task. Write a response that appropriately completes the request. 
 
                     ### Instruction:
                     {example["instruction"][i]}
 
 
                     ### Response:
-                    """)
-    return  output_texts
+                    """
+            )
+    return output_texts
 
 def extract_answer_letter(sentence: str) -> str:
     sentence_ = sentence.strip()
@@ -81,7 +54,6 @@ def extract_answer_letter(sentence: str) -> str:
         return pred_answers[0]
     else:
         return ""
-
 
 def extract_answer_number(sentence: str) -> float:
     sentence = sentence.replace(",", "")
@@ -96,41 +68,103 @@ def extract_answer_number(sentence: str) -> float:
             pred_answer = float("inf")
     return pred_answer
 
+def evaluate():
 
-dataset = dataset['train'].map(group_batch, batched=True, batch_size=4)
+# パス
+    base_model = "meta-llama/Llama-2-7b-hf"
+    adapter = "lora"
+    num_train_epochs = 3
+    device_map = {"": 0}
+    batch_size = 16
+    dataset = "SVAMP"
+    load_in_8bit = True
+    load_in_4bit = False
 
-number_of_correct_answers = 0
-number_of_examples = 0
+    if not load_in_8bit ^ load_in_4bit:
+        raise ValueError("load_in_8bit and load_in_4bit cannot be True at the same time.")
+    checkpoint_path = f"./trained_models/{base_model}_{adapter}_{num_train_epochs}/result"
+    data_path = f"./dataset/{dataset}/test.json"
 
-for batch in dataset:
-    # どうやってバッチ化する?
-    batched_input = generate_prompt(batch)
-    batched_answer = list(map(float,batch["answer"]))
-    batched_encoded_input = tokenizer(batched_input, padding=True, return_tensors="pt").to("cuda")
-
-    start_time = time.time()
-    batched_output = model.generate(
-        **batched_encoded_input,
-        generation_config=generation_config,
-        return_dict_in_generate=True,
-        output_scores=True,
-        max_new_tokens=256,
+    wandb.init(
+            project_name="llm-evaluation",
+            config={
+                "base_model": base_model,
+                "adapter": adapter,
+                "checkpoint_path": checkpoint_path,
+                "num_train_epochs": num_train_epochs,
+                "batch_size": batch_size,
+                "dataset": dataset,
+                "load_in_8bit": load_in_8bit,
+                "load_in_4bit": load_in_4bit,
+            },
     )
-    end_time = time.time()
-    print(f"Generate response takes {end_time - start_time}s ...")
-    batched_output_sequences = batched_output.sequences
-    batched_decoded_output = tokenizer.batch_decode(batched_output.sequences,skip_special_tokens=True)
-    batched_generated_answer = [
-        extract_answer_number(decoded_output.split("### Response:")[1])
-        for decoded_output in batched_decoded_output
-    ]
 
-    for decoded_output in batched_decoded_output:
-        print("------------")
-        print(decoded_output)
-        print("------------")
+    print("loading weights from {}".format(checkpoint_path))
 
-    number_of_correct_answers += np.sum(
-        np.array(batched_answer) == np.array(batched_generated_answer)
+# modelの読み込み
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=load_in_8bit, load_in_4bit=load_in_4bit
     )
-    number_of_examples += len(batched_answer)
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        quantization_config=quantization_config,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+    )
+    model = peft.PeftModel.from_pretrained(model, checkpoint_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    tokenizer.pad_token_id = 0
+
+    # generate configの設定
+    # 要見直し
+    generation_config = transformers.GenerationConfig(max_new_tokens=256)
+
+    # load dataset
+    dataset = datasets.load_dataset("json", data_files=data_path)
+    num_examples = len(dataset["train"])
+
+    dataset = dataset["train"].map(group_batch, batched=True, batch_size=4)
+
+    number_of_correct_answers = 0
+    number_of_examples = 0
+
+    for batch in dataset:
+        # どうやってバッチ化する?
+        batched_input = generate_prompt(batch)
+        batched_answer = list(map(float, batch["answer"]))
+        batched_encoded_input = tokenizer(
+            batched_input, padding=True, return_tensors="pt"
+        ).to("cuda")
+
+        start_time = time.time()
+        batched_output = model.generate(
+            **batched_encoded_input,
+            generation_config=generation_config,
+            return_dict_in_generate=True,
+            output_scores=True,
+            max_new_tokens=256,
+        )
+        end_time = time.time()
+        print(f"Generate response takes {end_time - start_time}s ...")
+        batched_output_sequences = batched_output.sequences
+        batched_decoded_output = tokenizer.batch_decode(
+            batched_output.sequences, skip_special_tokens=True
+        )
+        batched_generated_answer = [
+            extract_answer_number(decoded_output.split("### Response:")[1])
+            for decoded_output in batched_decoded_output
+        ]
+
+        number_of_correct_answers += np.sum(
+            np.array(batched_answer) == np.array(batched_generated_answer)
+        )
+        number_of_examples += len(batched_answer)
+
+        accuracy = number_of_correct_answers / number_of_examples
+        wandb.log({"accuracy": accuracy})
+
+if __name__ == "__main__":
+    fire.Fire(evaluate)
+
