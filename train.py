@@ -44,6 +44,7 @@ def formatting_func(example: dict):
     return output_texts
 
 def generate_peft_config(adapter: str):
+
     if "lora" == adapter:
         # とりまデフォルトで・・・
         lora_config = peft.LoraConfig(
